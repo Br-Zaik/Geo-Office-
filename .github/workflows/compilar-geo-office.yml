@@ -1,0 +1,261 @@
+name: Compilar Geo Office
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+      - ".github/workflows/compilar-geo-office.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: geo-office-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compilar:
+    name: Crear APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Buscar y extraer ZIP
+        id: preparar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYTHON'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          repositorio = Path.cwd()
+          destino = Path(os.environ["RUNNER_TEMP"]) / "geo-office-extraido"
+
+          archivos_zip = [
+              archivo
+              for archivo in repositorio.rglob("*")
+              if archivo.is_file()
+              and archivo.suffix.lower() == ".zip"
+              and ".git" not in archivo.parts
+          ]
+
+          if not archivos_zip:
+              raise SystemExit(
+                  "ERROR: No se encontró ningún archivo ZIP en el repositorio."
+              )
+
+          def fecha_git(archivo: Path) -> int:
+              relativo = archivo.relative_to(repositorio)
+
+              resultado = subprocess.run(
+                  [
+                      "git",
+                      "log",
+                      "-1",
+                      "--format=%ct",
+                      "--",
+                      str(relativo),
+                  ],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+
+              texto = resultado.stdout.strip()
+
+              if texto.isdigit():
+                  return int(texto)
+
+              return int(archivo.stat().st_mtime)
+
+          zip_elegido = max(
+              archivos_zip,
+              key=fecha_git,
+          )
+
+          print(f"ZIP seleccionado: {zip_elegido}")
+
+          if destino.exists():
+              shutil.rmtree(destino)
+
+          destino.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          try:
+              archivo_comprimido = zipfile.ZipFile(zip_elegido)
+          except zipfile.BadZipFile:
+              raise SystemExit(
+                  f"ERROR: El archivo no es un ZIP válido: {zip_elegido}"
+              )
+
+          with archivo_comprimido:
+              for elemento in archivo_comprimido.infolist():
+                  ruta_final = (destino / elemento.filename).resolve()
+
+                  try:
+                      ruta_final.relative_to(destino.resolve())
+                  except ValueError:
+                      raise SystemExit(
+                          "ERROR: El ZIP contiene una ruta insegura: "
+                          + elemento.filename
+                      )
+
+                  if elemento.is_dir():
+                      ruta_final.mkdir(
+                          parents=True,
+                          exist_ok=True,
+                      )
+                      continue
+
+                  ruta_final.parent.mkdir(
+                      parents=True,
+                      exist_ok=True,
+                  )
+
+                  with archivo_comprimido.open(elemento) as origen:
+                      with open(ruta_final, "wb") as salida:
+                          shutil.copyfileobj(origen, salida)
+
+          archivos_gradlew = list(destino.rglob("gradlew"))
+
+          if not archivos_gradlew:
+              raise SystemExit(
+                  "ERROR: El ZIP no contiene gradlew. "
+                  "Debes subir el proyecto Android Studio completo."
+              )
+
+          gradlew = min(
+              archivos_gradlew,
+              key=lambda archivo: len(archivo.parts),
+          )
+
+          carpeta_proyecto = gradlew.parent
+
+          settings_gradle = carpeta_proyecto / "settings.gradle"
+          settings_gradle_kts = carpeta_proyecto / "settings.gradle.kts"
+
+          if not settings_gradle.exists() and not settings_gradle_kts.exists():
+              raise SystemExit(
+                  "ERROR: No se encontró settings.gradle "
+                  "ni settings.gradle.kts junto a gradlew."
+              )
+
+          nombre = zip_elegido.stem
+
+          nombre_limpio = re.sub(
+              r"[^A-Za-z0-9._-]+",
+              "-",
+              nombre,
+          ).strip("-")
+
+          if not nombre_limpio:
+              nombre_limpio = "Geo-Office"
+
+          salida_github = Path(os.environ["GITHUB_OUTPUT"])
+
+          with salida_github.open("a", encoding="utf-8") as archivo:
+              archivo.write(
+                  f"project_dir={carpeta_proyecto}\n"
+              )
+              archivo.write(
+                  f"artifact_name={nombre_limpio}-APK\n"
+              )
+
+          print(f"Proyecto encontrado: {carpeta_proyecto}")
+          PYTHON
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Preparar Gradle
+        shell: bash
+        working-directory: ${{ steps.preparar.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          sed -i 's/\r$//' gradlew
+          chmod +x gradlew
+
+          ./gradlew --version
+
+      - name: Compilar Geo Office
+        shell: bash
+        working-directory: ${{ steps.preparar.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            assembleDebug
+
+      - name: Buscar APK generado
+        id: apk
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.preparar.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          CARPETA_APKS="$RUNNER_TEMP/apks-geo-office"
+
+          rm -rf "$CARPETA_APKS"
+          mkdir -p "$CARPETA_APKS"
+
+          cantidad=0
+
+          while IFS= read -r -d '' archivo_apk; do
+            cantidad=$((cantidad + 1))
+
+            nombre_apk="$(basename "$archivo_apk")"
+
+            cp \
+              "$archivo_apk" \
+              "$CARPETA_APKS/${cantidad}-${nombre_apk}"
+
+            echo "APK encontrado: $archivo_apk"
+          done < <(
+            find "$PROJECT_DIR" \
+              -type f \
+              -name "*.apk" \
+              -path "*/build/outputs/apk/*" \
+              ! -path "*/androidTest/*" \
+              -print0
+          )
+
+          if [ "$cantidad" -eq 0 ]; then
+            echo "::error::La compilación terminó sin generar un APK."
+            exit 1
+          fi
+
+          echo "apk_dir=$CARPETA_APKS" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.preparar.outputs.artifact_name }}
+          path: ${{ steps.apk.outputs.apk_dir }}/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
