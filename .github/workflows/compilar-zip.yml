@@ -1,0 +1,231 @@
+name: Geo Office - Compilar ZIP
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "zips/**/*.zip"
+      - ".github/workflows/compilar-zip.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: geo-office-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compilar:
+    name: Compilar Geo Office
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Buscar y extraer el ZIP más reciente
+        id: preparar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' archivos_zip < <(
+            find zips -type f -iname '*.zip' -print0
+          )
+
+          if [ "${#archivos_zip[@]}" -eq 0 ]; then
+            echo "::error::No existe ningún ZIP dentro de la carpeta zips."
+            exit 1
+          fi
+
+          zip_elegido=""
+          fecha_mas_nueva=0
+
+          for archivo in "${archivos_zip[@]}"; do
+            fecha="$(
+              git log -1 --format=%ct -- "$archivo" 2>/dev/null || echo 0
+            )"
+
+            fecha="${fecha:-0}"
+
+            if [ "$fecha" -ge "$fecha_mas_nueva" ]; then
+              fecha_mas_nueva="$fecha"
+              zip_elegido="$archivo"
+            fi
+          done
+
+          if [ -z "$zip_elegido" ]; then
+            echo "::error::No se pudo seleccionar el archivo ZIP."
+            exit 1
+          fi
+
+          destino="$RUNNER_TEMP/geo-office-src"
+
+          rm -rf "$destino"
+          mkdir -p "$destino"
+
+          ZIP_ELEGIDO="$zip_elegido" DESTINO="$destino" python3 - <<'PY'
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          zip_path = Path(os.environ["ZIP_ELEGIDO"])
+          root = Path(os.environ["DESTINO"]).resolve()
+
+          try:
+              archivo_zip = zipfile.ZipFile(zip_path)
+          except zipfile.BadZipFile:
+              raise SystemExit(f"El archivo no es un ZIP válido: {zip_path}")
+
+          with archivo_zip:
+              for elemento in archivo_zip.infolist():
+                  destino_elemento = (root / elemento.filename).resolve()
+
+                  try:
+                      destino_elemento.relative_to(root)
+                  except ValueError:
+                      raise SystemExit(
+                          f"Ruta insegura detectada dentro del ZIP: "
+                          f"{elemento.filename}"
+                      )
+
+                  if elemento.is_dir():
+                      destino_elemento.mkdir(
+                          parents=True,
+                          exist_ok=True
+                      )
+                      continue
+
+                  destino_elemento.parent.mkdir(
+                      parents=True,
+                      exist_ok=True
+                  )
+
+                  with archivo_zip.open(elemento) as origen:
+                      with open(destino_elemento, "wb") as salida:
+                          shutil.copyfileobj(origen, salida)
+          PY
+
+          mapfile -d '' gradle_wrappers < <(
+            find "$destino" -type f -name gradlew -print0
+          )
+
+          if [ "${#gradle_wrappers[@]}" -eq 0 ]; then
+            echo "::error::El ZIP no contiene el archivo gradlew."
+            echo "::error::Debes subir el proyecto Android Studio completo."
+            exit 1
+          fi
+
+          gradlew_elegido="${gradle_wrappers[0]}"
+
+          for candidato in "${gradle_wrappers[@]}"; do
+            if [ "${#candidato}" -lt "${#gradlew_elegido}" ]; then
+              gradlew_elegido="$candidato"
+            fi
+          done
+
+          carpeta_proyecto="$(dirname "$gradlew_elegido")"
+
+          nombre_zip="$(basename "$zip_elegido")"
+          nombre_zip="${nombre_zip%.*}"
+
+          nombre_seguro="$(
+            printf '%s' "$nombre_zip" |
+            tr -cs 'A-Za-z0-9._-' '_' |
+            sed 's/^_*//;s/_*$//'
+          )"
+
+          if [ -z "$nombre_seguro" ]; then
+            nombre_seguro="Geo-Office"
+          fi
+
+          echo "project_dir=$carpeta_proyecto" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${nombre_seguro}-APK" >> "$GITHUB_OUTPUT"
+
+          echo "----------------------------------------"
+          echo "ZIP seleccionado: $zip_elegido"
+          echo "Proyecto encontrado: $carpeta_proyecto"
+          echo "----------------------------------------"
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Aceptar licencias de Android
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Compilar APK Debug
+        shell: bash
+        working-directory: ${{ steps.preparar.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          chmod +x gradlew
+
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            assembleDebug
+
+      - name: Buscar APK generado
+        id: reunir
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.preparar.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          carpeta_apks="$RUNNER_TEMP/geo-office-apks"
+
+          rm -rf "$carpeta_apks"
+          mkdir -p "$carpeta_apks"
+
+          mapfile -d '' archivos_apk < <(
+            find "$PROJECT_DIR" \
+              -type f \
+              -name '*.apk' \
+              -path '*/build/outputs/apk/*' \
+              ! -path '*/androidTest/*' \
+              -print0
+          )
+
+          if [ "${#archivos_apk[@]}" -eq 0 ]; then
+            echo "::error::La compilación terminó, pero no se encontró ningún APK."
+            exit 1
+          fi
+
+          contador=1
+
+          for apk in "${archivos_apk[@]}"; do
+            nombre_apk="$(basename "$apk")"
+
+            cp \
+              "$apk" \
+              "$carpeta_apks/${contador}-${nombre_apk}"
+
+            echo "APK encontrado: $apk"
+
+            contador=$((contador + 1))
+          done
+
+          echo "apk_dir=$carpeta_apks" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar APK para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.preparar.outputs.artifact_name }}
+          path: ${{ steps.reunir.outputs.apk_dir }}/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
